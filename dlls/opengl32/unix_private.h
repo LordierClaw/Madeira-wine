@@ -75,19 +75,48 @@ static inline GLsync get_unix_sync( GLsync sync )
 
 #ifdef _WIN64
 
+/* Madeira: guest addresses are converted with ios_wow_host_ptr() (wine/unixlib.h),
+ * which is ULongToPtr everywhere but iOS. A host pointer inside the guest window
+ * goes back to the guest by plain truncation: the window base is 4 GB aligned. */
 static inline void *copy_wow64_ptr32s( UINT_PTR address, ULONG count )
 {
-    ULONG *ptrs = (ULONG *)address;
+    ULONG *ptrs = ios_wow_host_ptr( address );
     void **tmp;
 
     if (!ptrs || !(tmp = calloc( count, sizeof(*tmp) ))) return NULL;
-    while (count--) tmp[count] = ULongToPtr(ptrs[count]);
+    while (count--) tmp[count] = ios_wow_host_ptr( ptrs[count] );
+    return tmp;
+}
+
+/* A pointer parameter that is an offset into the buffer bound at `binding` when
+ * there is one, and a pointer to guest memory otherwise. Guest memory never lies
+ * in the first 64 KB, so smaller values are offsets (or NULL) without asking. */
+static inline void *wow64_buffer_ptr( TEB *teb, GLenum binding, ULONG value )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLint name = 0;
+
+    if (value < 0x10000) return ULongToPtr( value );
+    if (funcs && funcs->p_glGetIntegerv) funcs->p_glGetIntegerv( binding, &name );
+    return name ? ULongToPtr( value ) : ios_wow_host_ptr( value );
+}
+
+static inline void *copy_wow64_buffer_ptr32s( TEB *teb, GLenum binding, UINT_PTR address, ULONG count )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    ULONG *ptrs = ios_wow_host_ptr( address );
+    GLint name = 0;
+    void **tmp;
+
+    if (!ptrs || !(tmp = calloc( count, sizeof(*tmp) ))) return NULL;
+    if (funcs && funcs->p_glGetIntegerv) funcs->p_glGetIntegerv( binding, &name );
+    while (count--) tmp[count] = name ? ULongToPtr( ptrs[count] ) : ios_wow_host_ptr( ptrs[count] );
     return tmp;
 }
 
 static inline TEB *get_teb64( ULONG teb32 )
 {
-    TEB32 *teb32_ptr = ULongToPtr( teb32 );
+    TEB32 *teb32_ptr = ios_wow_host_ptr( teb32 );
     return (TEB *)((char *)teb32_ptr + teb32_ptr->WowTebOffset);
 }
 

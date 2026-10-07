@@ -42,6 +42,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
     fastsync for events and semaphores, pull request #16); `d770df01ae7`
     (ntdll ARM64EC: opt-in guard against a self-deadlock in the loader's
     image-map notification, pull request #17).
+  - opengl32: OpenGL ES contexts for Madeira's winios WGL driver
+    (`dlls/opengl32/unix_wgl.c`) and the fixed low image base limited to x86
+    builds (`dlls/opengl32/Makefile.in`). Author: Connor Gow, written with AI
+    assistance, 2026-09-26. Carried as a patch in the Madeira repository
+    (`patches/wine-opengl-winios.patch`).
+  - opengl32: 32-bit (WoW64) callers on iOS. `make_opengl` makes the wow64
+    thunks convert embedded guest pointers with `ios_wow_host_ptr()`, keeps
+    handles and callbacks unchanged, and passes pointer-or-offset parameters
+    unchanged while a buffer is bound (`dlls/opengl32/make_opengl`,
+    regenerated `unix_thunks.c`, `unix_private.h`, `unix_wgl.c`). Author:
+    Connor Gow, written with AI assistance, 2026-09-27. Carried in
+    `patches/wine-opengl-winios.patch`.
 
 The LGPL permits combining this library with proprietary components (such
 as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the
