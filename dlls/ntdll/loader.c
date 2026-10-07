@@ -1063,6 +1063,69 @@ static FARPROC find_forwarded_export( HMODULE module, const char *forward, LPCWS
 }
 
 
+#ifdef __arm64ec__
+/* Madeira copies EC images into the iOS JIT pool. MSVCP140 initializes its
+ * mutable stream objects there, so x64 clients must import the same data
+ * address, not the uninitialized original image. Code exports must retain
+ * their x64 entry thunks. Keep this correction scoped to the measured DLL. */
+static FARPROC madeira_msvcp_data_export( HMODULE module, DWORD rva )
+{
+    static int enabled = -1, logged;
+    static const WCHAR dll_name[] = L"msvcp140.dll";
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_SECTION_HEADER *sec;
+    WINE_MODREF *wm = get_modref( module );
+    unsigned int i;
+    void *original, *translated;
+    extern void *xlate_ios_jit( void *ptr );
+    extern void *xlate_ios_jit_rev( void *ptr );
+
+    if (!wm || wm->ldr.BaseDllName.Length != sizeof(dll_name) - sizeof(WCHAR) ||
+        wcsnicmp( wm->ldr.BaseDllName.Buffer, dll_name, ARRAY_SIZE(dll_name) - 1 ))
+        return NULL;
+    if (!arm64ec_get_module_metadata( module )) return NULL;
+    if (!(nt = RtlImageNtHeader( module )) || rva >= nt->OptionalHeader.SizeOfImage)
+        return NULL;
+
+    sec = IMAGE_FIRST_SECTION( nt );
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+    {
+        DWORD size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (rva < sec->VirtualAddress || rva - sec->VirtualAddress >= size) continue;
+        if ((sec->Characteristics & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE))
+            != (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)) return NULL;
+
+        if (enabled < 0)
+        {
+            UNICODE_STRING name, value;
+            WCHAR buffer[8];
+            RtlInitUnicodeString( &name, L"MADEIRA_EC_DATA_EXPORTS" );
+            value.Buffer = buffer;
+            value.Length = 0;
+            value.MaximumLength = sizeof(buffer);
+            /* Enabled in this build; an exact "0" permits a controlled bisect. */
+            enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ||
+                      value.Length != sizeof(WCHAR) || buffer[0] != '0';
+        }
+        if (!enabled) return NULL;
+        original = get_rva( module, rva );
+        translated = xlate_ios_jit( original );
+        /* No mapping or a mapping that does not round-trip: preserve the
+         * original address. Never call the raw native hook through check_call. */
+        if (!translated || translated == original || xlate_ios_jit_rev( translated ) != original)
+            return original;
+        if (logged < 32)
+        {
+            logged++;
+            WARN( "[madeira-data-export] MSVCP140 DATA rva %#lx: %p -> %p\n",
+                  rva, original, translated );
+        }
+        return translated;
+    }
+    return NULL;
+}
+#endif
+
 /*************************************************************************
  *		find_ordinal_export
  *
@@ -1090,6 +1153,17 @@ static FARPROC find_ordinal_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY
     if (((const char *)proc >= (const char *)exports) && 
         ((const char *)proc < (const char *)exports + exp_size))
         return find_forwarded_export( module, (const char *)proc, load_path, importer, is_dynamic );
+
+#ifdef __arm64ec__
+    /* EC static imports already pass through arm64ec_redirect_ptr below.
+     * Cover x64 static imports and GetProcAddress/ordinal lookups here.
+     * Return data before the function-only snoop/relay wrappers. */
+    if (is_dynamic || !importer || !arm64ec_get_module_metadata( importer->ldr.DllBase ))
+    {
+        FARPROC data = madeira_msvcp_data_export( module, functions[ordinal] );
+        if (data) return data;
+    }
+#endif
 
     if (TRACE_ON(snoop))
     {
