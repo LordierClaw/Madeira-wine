@@ -3631,27 +3631,52 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
         }
         IOS_FILE_COUNT(full_miss);
 #ifdef WINE_IOS
-        /* Asset probes often miss only the last component (or its case).
-         * Resolve an existing parent in one stat instead of walking every
-         * prefix again. This is a fresh lookup, not a path/result cache.
-         * Keep the ordinary walk for missing parents, short-name parents,
-         * reparse points, trailing separators and the Unix namespace. */
-        if (!is_unix && (p = strrchr( unix_name + pos, '/' )) > unix_name + pos && p[1])
+        /* Asset/DLC probes also miss intermediate directories. Try the full
+         * parent first, then binary-search its ancestors for a fresh, exact
+         * directory prefix. Resume the normal case/short-name/reparse walk
+         * after that prefix; a failed stat is never itself a final result.
+         * No lookup results survive this call. Keep Unix paths unchanged. */
+        if (!is_unix)
         {
-            const WCHAR *leaf = name + name_len;
+            unsigned int parents = 0, low = 0, high, candidate, i;
+            int prefix_pos = pos;
 
-            while (leaf > name && leaf[-1] != '\\') leaf--;
-            IOS_FILE_COUNT(parent_try);
-            *p = 0;
-            ret = fstatat( root_fd, unix_name, &st, 0 );
-            *p = '/';
-            if (!ret && S_ISDIR( st.st_mode ))
+            /* A trailing slash is part of the final component, not another
+             * parent. Count boundaries in the converted path, not its bytes. */
+            for (p = unix_name + pos + 1; *p; p++)
+                if (*p == '/' && p[1]) parents++;
+            high = candidate = parents;
+            while (low < high)
             {
+                p = unix_name + pos;
+                for (i = 0; i < candidate; i++) p = strchr( p + 1, '/' );
+                IOS_FILE_COUNT(parent_try);
+                *p = 0;
+                ret = fstatat( root_fd, unix_name, &st, 0 );
+                *p = '/';
+                if (!ret && S_ISDIR( st.st_mode ))
+                {
+                    low = candidate;
+                    prefix_pos = p - unix_name;
+                }
+                else high = candidate - 1;
+                candidate = low + (high - low + 1) / 2;
+            }
+            if (low)
+            {
+                const WCHAR *next = name;
+
+                /* Keep the original UTF-16 offset for reparse resolution. */
+                for (i = 0; i < low; i++)
+                {
+                    while (*next != '\\') next++;
+                    next++;
+                }
                 IOS_FILE_COUNT(parent_hit);
-                pos = p - unix_name;
-                nt_pos += leaf - name;
-                name_len -= leaf - name;
-                name = leaf;
+                pos = prefix_pos;
+                nt_pos += next - name;
+                name_len -= next - name;
+                name = next;
             }
         }
 #endif
