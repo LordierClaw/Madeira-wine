@@ -3613,6 +3613,29 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
             return STATUS_SUCCESS;
         }
+#ifdef WINE_IOS
+        /* Asset probes often miss only the last component (or its case).
+         * Resolve an existing parent in one stat instead of walking every
+         * prefix again. This is a fresh lookup, not a path/result cache.
+         * Keep the ordinary walk for missing parents, short-name parents,
+         * reparse points, trailing separators and the Unix namespace. */
+        if (!is_unix && (p = strrchr( unix_name + pos, '/' )) > unix_name + pos && p[1])
+        {
+            const WCHAR *leaf = name + name_len;
+
+            while (leaf > name && leaf[-1] != '\\') leaf--;
+            *p = 0;
+            ret = fstatat( root_fd, unix_name, &st, 0 );
+            *p = '/';
+            if (!ret && S_ISDIR( st.st_mode ))
+            {
+                pos = p - unix_name;
+                nt_pos += leaf - name;
+                name_len -= leaf - name;
+                name = leaf;
+            }
+        }
+#endif
     }
 
     if (!name_len)  /* empty name -> drive root doesn't exist */
