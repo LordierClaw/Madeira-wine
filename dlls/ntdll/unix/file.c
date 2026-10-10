@@ -128,6 +128,12 @@
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
+#ifdef WINE_IOS
+#include "ios_file_profile.h"
+#else
+#define IOS_FILE_COUNT(n) do {} while (0)
+#endif
+
 #define MAX_DOS_DRIVES 26
 
 /* just in case... */
@@ -2999,6 +3005,8 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     struct stat st;
     int fd, ret;
 
+    IOS_FILE_COUNT(components);
+
     /* try a shortcut for this directory */
 
     unix_name[pos++] = '/';
@@ -3007,6 +3015,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     {
         unix_name[pos + ret] = 0;
         if (!fstatat( root_fd, unix_name, &st, 0 )) return STATUS_SUCCESS;
+        IOS_FILE_COUNT(component_miss);
     }
     if (check_case) goto not_found;  /* we want an exact match */
 
@@ -3020,7 +3029,11 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     is_name_8_dot_3 = is_name_8_dot_3 && length >= 8 && name[4] == '~';
 #endif
 
-    if (!is_name_8_dot_3 && !get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+    if (!is_name_8_dot_3)
+    {
+        IOS_FILE_COUNT(case_query);
+        if (!get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+    }
 
     /* now look for it through the directory */
 
@@ -3072,6 +3085,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     }
 #endif /* VFAT_IOCTL_READDIR_BOTH */
 
+    IOS_FILE_COUNT(scans);
     if ((fd = openat( root_fd, unix_name, O_RDONLY )) == -1) return errno_to_status( errno );
     if (!(dir = fdopendir( fd )))
     {
@@ -3082,6 +3096,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     unix_name[pos - 1] = '/';
     while ((de = readdir( dir )))
     {
+        IOS_FILE_COUNT(entries);
         ret = ntdll_umbstowcs( de->d_name, strlen(de->d_name), buffer, MAX_DIR_ENTRY_LEN );
         if (ret == length && !wcsnicmp( buffer, name, ret ))
         {
@@ -3610,9 +3625,11 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
         for (p = unix_name + pos ; *p; p++) if (*p == '\\') *p = '/';
         if (!fstatat( root_fd, unix_name, &st, 0 ))
         {
+            IOS_FILE_COUNT(full_hit);
             if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
             return STATUS_SUCCESS;
         }
+        IOS_FILE_COUNT(full_miss);
 #ifdef WINE_IOS
         /* Asset probes often miss only the last component (or its case).
          * Resolve an existing parent in one stat instead of walking every
@@ -3624,11 +3641,13 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             const WCHAR *leaf = name + name_len;
 
             while (leaf > name && leaf[-1] != '\\') leaf--;
+            IOS_FILE_COUNT(parent_try);
             *p = 0;
             ret = fstatat( root_fd, unix_name, &st, 0 );
             *p = '/';
             if (!ret && S_ISDIR( st.st_mode ))
             {
+                IOS_FILE_COUNT(parent_hit);
                 pos = p - unix_name;
                 nt_pos += leaf - name;
                 name_len -= leaf - name;
@@ -4712,6 +4731,9 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     BOOL name_hidden = FALSE;
     BOOL created = FALSE;
     unsigned int status;
+#ifdef WINE_IOS
+    struct ios_file_profile_call profile = {0};
+#endif
 
     TRACE( "handle=%p access=%08x name=%s objattr=%08x root=%p sec=%p io=%p alloc_size=%p "
            "attr=%08x sharing=%08x disp=%d options=%08x ea=%p.0x%08x\n",
@@ -4721,6 +4743,9 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
     *handle = 0;
     if (!attr || !attr->ObjectName) return STATUS_INVALID_PARAMETER;
+#ifdef WINE_IOS
+    ios_file_profile_begin( &profile, IOS_FILE_CREATE );
+#endif
 
     if (alloc_size) FIXME( "alloc_size not supported\n" );
 
@@ -4732,6 +4757,9 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     }
     else status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
                                          options & FILE_OPEN_REPARSE_POINT );
+#ifdef WINE_IOS
+    ios_file_profile_lookup_done( &profile );
+#endif
 
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
@@ -4803,6 +4831,8 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
  done:
 #ifdef WINE_IOS
+    ios_file_profile_end( &profile, attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR),
+                          disposition, status );
     /* ml733: track the video stream the cutscene decoder reads.
      *
      * The game plays its intro and then sits on a black screen at 60 FPS
@@ -5029,8 +5059,16 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef WINE_IOS
+    struct ios_file_profile_call profile = {0};
+    ios_file_profile_begin( &profile, IOS_FILE_QUERY_FULL );
+#endif
 
-    if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
+    status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE );
+#ifdef WINE_IOS
+    ios_file_profile_lookup_done( &profile );
+#endif
+    if (!status)
     {
         ULONG attributes;
         struct stat st;
@@ -5043,6 +5081,10 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
             fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+#ifdef WINE_IOS
+    ios_file_profile_end( &profile, attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR),
+                          FILE_OPEN, status );
+#endif
     free( unix_name );
     free( nt_name.Buffer );
     return status;
@@ -5058,8 +5100,16 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef WINE_IOS
+    struct ios_file_profile_call profile = {0};
+    ios_file_profile_begin( &profile, IOS_FILE_QUERY );
+#endif
 
-    if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
+    status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE );
+#ifdef WINE_IOS
+    ios_file_profile_lookup_done( &profile );
+#endif
+    if (!status)
     {
         ULONG attributes;
         struct stat st;
@@ -5072,6 +5122,10 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
             status = fill_file_info( &st, attributes, info, FileBasicInformation );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+#ifdef WINE_IOS
+    ios_file_profile_end( &profile, attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR),
+                          FILE_OPEN, status );
+#endif
     free( unix_name );
     free( nt_name.Buffer );
     return status;
