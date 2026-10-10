@@ -7631,7 +7631,7 @@ ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code 
     /* Madeira/iOS (ml668): the host gamepad slot. Body in
      * build/win32u-unix/driver_ios.c; arg1 packs the user index in its low
      * byte and a NtUserGamepadOp_* selector above it, arg2 is the guest
-     * output buffer (translated by wow64win for a 32-bit caller). */
+     * buffer (translated by wow64win for a 32-bit caller). */
     case NtUserCallTwoParam_GetGamepadState:
 #ifdef WINE_IOS
         return ios_gamepad_query( arg1 & 0xff, (arg1 >> 8) & 0xff, (void *)arg2 );

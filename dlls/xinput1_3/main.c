@@ -814,6 +814,21 @@ static BOOL host_pad_state(DWORD index, XINPUT_STATE *state)
     return TRUE;
 }
 
+/* The last XInputSetState per host slot. XInputEnable(FALSE) silences the
+ * motors and XInputEnable(TRUE) sends these again, as Windows does; while
+ * disabled XInputSetState only records. The host plays them on the physical
+ * controller; a win32u that does not know NtUserGamepadOp_SetVibration
+ * answers 0, which is ignored. */
+static XINPUT_VIBRATION host_vibration[XUSER_MAX_COUNT];
+
+static void host_pad_vibrate(DWORD index)
+{
+    XINPUT_VIBRATION motors = {0};
+
+    if (InterlockedCompareExchange(&host_enabled, 0, 0)) motors = host_vibration[index];
+    NtUserGetGamepadState(index, NtUserGamepadOp_SetVibration, &motors);
+}
+
 /* Is the host publishing ANY pad? Deliberately not cached: a controller can be
  * paired halfway through a session, and four syscalls into a memory read is
  * cheaper than the staleness bug a cache would buy. */
@@ -837,6 +852,19 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         xinput_instance = inst;
         DisableThreadLibraryCalls(inst);
         break;
+    case DLL_PROCESS_DETACH:
+    {
+        /* A game that exits with its motors running must not leave the host
+         * pad rumbling (Windows' driver stops them with the process); the
+         * host session outlives the game. */
+        XINPUT_VIBRATION off = {0};
+        DWORD i;
+
+        for (i = 0; i < XUSER_MAX_COUNT; i++)
+            if (host_vibration[i].wLeftMotorSpeed || host_vibration[i].wRightMotorSpeed)
+                NtUserGetGamepadState(i, NtUserGamepadOp_SetVibration, &off);
+        break;
+    }
     }
     return TRUE;
 }
@@ -852,7 +880,14 @@ void WINAPI DECLSPEC_HOTPATCH XInputEnable(BOOL enable)
     value (sent to XInputSetState) to the controller and allow messages to
     be sent */
     InterlockedExchange(&host_enabled, !!enable);
-    if (host_pad_any()) return;
+    if (host_pad_any())
+    {
+        XINPUT_STATE host_state;
+
+        for (index = 0; index < XUSER_MAX_COUNT; index++)
+            if (host_pad_state(index, &host_state)) host_pad_vibrate(index);
+        return;
+    }
 
     start_update_thread();
 
@@ -875,8 +910,12 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
 
     if (!vibration) return ERROR_BAD_ARGUMENTS;
-    /* Host capabilities do not advertise force feedback. */
-    if (host_pad_state(index, &host_state)) return ERROR_SUCCESS;
+    if (host_pad_state(index, &host_state))
+    {
+        host_vibration[index] = *vibration;
+        host_pad_vibrate(index);
+        return ERROR_SUCCESS;
+    }
 
     start_update_thread();
 

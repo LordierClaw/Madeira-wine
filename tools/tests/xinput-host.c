@@ -7,6 +7,7 @@
 
 static XINPUT_STATE sample;
 static BOOL connected[XUSER_MAX_COUNT] = { TRUE, FALSE, FALSE, FALSE };
+static XINPUT_VIBRATION motors[XUSER_MAX_COUNT];
 
 static ULONG_PTR WINAPI query(ULONG_PTR arg1, ULONG_PTR arg2, ULONG code)
 {
@@ -22,6 +23,7 @@ static ULONG_PTR WINAPI query(ULONG_PTR arg1, ULONG_PTR arg2, ULONG code)
         caps->Type = XINPUT_DEVTYPE_GAMEPAD;
         caps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
     }
+    else if (op == NtUserGamepadOp_SetVibration) motors[index] = *(XINPUT_VIBRATION *)arg2;
     else assert(0);
     return 1;
 }
@@ -56,7 +58,10 @@ int main(void)
     assert(XInputGetState(0, NULL) == ERROR_BAD_ARGUMENTS);
     assert(XInputGetCapabilities(0, 0, &caps) == ERROR_SUCCESS && caps.Flags == 0);
     assert(XInputGetCapabilities(0, 0, NULL) == ERROR_BAD_ARGUMENTS);
+    vibration.wLeftMotorSpeed = 0x8000;
+    vibration.wRightMotorSpeed = 0x1234;
     assert(XInputSetState(0, &vibration) == ERROR_SUCCESS);
+    assert(motors[0].wLeftMotorSpeed == 0x8000 && motors[0].wRightMotorSpeed == 0x1234);
     assert(XInputSetState(0, NULL) == ERROR_BAD_ARGUMENTS);
     assert(XInputGetKeystroke(0, 0, &key) == ERROR_SUCCESS);
     assert(key.VirtualKey == VK_PAD_A && key.Flags == XINPUT_KEYSTROKE_KEYDOWN);
@@ -65,11 +70,18 @@ int main(void)
     assert(key.VirtualKey == VK_PAD_A && key.Flags == XINPUT_KEYSTROKE_KEYUP);
     assert(XInputGetKeystroke(0, 0, NULL) == ERROR_BAD_ARGUMENTS);
     XInputEnable(FALSE);
+    assert(!motors[0].wLeftMotorSpeed && !motors[0].wRightMotorSpeed);
     assert(XInputGetState(0, &state) == ERROR_SUCCESS);
     XINPUT_GAMEPAD zero = {0};
     assert(!memcmp(&state.Gamepad, &zero, sizeof(zero)));
+    vibration.wLeftMotorSpeed = 0x4000;
+    assert(XInputSetState(0, &vibration) == ERROR_SUCCESS);
+    assert(!motors[0].wLeftMotorSpeed && !motors[0].wRightMotorSpeed);
     XInputEnable(TRUE);
+    assert(motors[0].wLeftMotorSpeed == 0x4000 && motors[0].wRightMotorSpeed == 0x1234);
     assert(XInputGetState(0, &state) == ERROR_SUCCESS && state.Gamepad.bLeftTrigger == 255);
+    DllMain(NULL, DLL_PROCESS_DETACH, NULL);
+    assert(!motors[0].wLeftMotorSpeed && !motors[0].wRightMotorSpeed);
     assert(XInputGetBatteryInformation(0, BATTERY_DEVTYPE_GAMEPAD, &battery) == ERROR_SUCCESS);
     assert(battery.BatteryType == BATTERY_TYPE_UNKNOWN);
     assert(XInputGetDSoundAudioDeviceGuids(0, &render, &capture) == ERROR_NOT_SUPPORTED);
@@ -77,6 +89,6 @@ int main(void)
     connected[0] = FALSE;
     assert(!host_pad_state(0, &state));
     assert(!memcmp(&state.Gamepad, &zero, sizeof(zero)));
-    puts("PASS: host XInput state/caps/edges/disable, invalid arguments, battery and per-index audio");
+    puts("PASS: host XInput state/caps/edges/disable, vibration, invalid arguments, battery and per-index audio");
     return 0;
 }

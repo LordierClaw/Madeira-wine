@@ -39,7 +39,24 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
-static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+/* iOS-Madeira ml1232: KUSER_SHARED_DATA cannot be mapped at 0x7ffe0000 on iOS
+ * (the mandatory 4 GB __PAGEZERO), so a read of that constant traps and the
+ * unix signal code services it against the real page (the ml952 sub-floor
+ * window). GetTickCount64 read it three times per call: three Mach exceptions
+ * per call, ~100 calls a second in Ori and the Will of the Wisps' gameplay and tens of thousands a
+ * second during its level loads. The server publishes TickCount and
+ * InterruptTime from the same monotonic clock NtQueryPerformanceCounter reads
+ * (mach_continuous_time in 100 ns units, frequency 10 MHz), so derive both from
+ * one system call instead. */
+static ULONGLONG madeira_interrupt_time(void)
+{
+    LARGE_INTEGER counter, freq;
+
+    NtQueryPerformanceCounter( &counter, &freq );
+    if (freq.QuadPart == 10000000 || !freq.QuadPart) return counter.QuadPart;
+    return counter.QuadPart / freq.QuadPart * 10000000 +
+           counter.QuadPart % freq.QuadPart * 10000000 / freq.QuadPart;
+}
 
 /* check if current version is NT or Win95 */
 static inline BOOL is_version_nt(void)
@@ -181,7 +198,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetSystemTimes( FILETIME *idle, FILETIME *kernel, 
 ULONG WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
 {
     /* note: we ignore TickCountMultiplier */
-    return user_shared_data->TickCount.LowPart;
+    return (ULONG)(madeira_interrupt_time() / 10000);   /* ml1232 */
 }
 
 
@@ -190,16 +207,8 @@ ULONG WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
  */
 ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
 {
-    ULONG high, low;
-
-    do
-    {
-        high = user_shared_data->TickCount.High1Time;
-        low = user_shared_data->TickCount.LowPart;
-    }
-    while (high != user_shared_data->TickCount.High2Time);
     /* note: we ignore TickCountMultiplier */
-    return (ULONGLONG)high << 32 | low;
+    return madeira_interrupt_time() / 10000;   /* ml1232 */
 }
 
 
@@ -208,15 +217,7 @@ ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
  */
 void WINAPI DECLSPEC_HOTPATCH QueryInterruptTime( ULONGLONG *time )
 {
-    ULONG high, low;
-
-    do
-    {
-        high = user_shared_data->InterruptTime.High1Time;
-        low = user_shared_data->InterruptTime.LowPart;
-    }
-    while (high != user_shared_data->InterruptTime.High2Time);
-    *time = (ULONGLONG)high << 32 | low;
+    *time = madeira_interrupt_time();   /* ml1232 */
 }
 
 

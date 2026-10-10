@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <assert.h>
 
 #define COBJMACROS
@@ -160,6 +161,83 @@ static void CDECL set_log_handler_dummy (MonoLogCallback callback, void *user_da
 {
 }
 
+/* iOS-Madeira ml1282: Mono settings this port needs, set before Mono starts.
+ *
+ * Only a process that loads Wine Mono gets here, 32-bit or 64-bit: a 64-bit FNA game's GC
+ * spun in the same hybrid-suspend loop (10,000 SuspendThread/ResumeThread pairs on one
+ * worker, no first frame) and ran to its stage with these set. Mono reads both through
+ * g_getenv = GetEnvironmentVariableW, once, in mono_jit_init_version (mono_thread_info_init
+ * and mini_parse_debug_options); madeira_mono_env_restore then puts the previous values
+ * back, so a child process does not inherit them (a .NET launcher's Unity game would hand
+ * them to its own Mono).
+ *  - MONO_THREADS_SUSPEND=coop: the default hybrid suspend stops threads with
+ *    SuspendThread + GetThreadContext, and on iOS a suspended thread keeps running
+ *    (MADEIRA_REAL_SUSPEND is off), so the GC moved objects under a live thread and Mono
+ *    aborted with "Cannot transition thread ... with DONE_BLOCKING" (Terraria).
+ *  - MONO_DEBUG += keep-delegates: a delegate handed to native code was finalized while
+ *    EnumDisplayMonitors still called it back (NullReferenceException in
+ *    Screen+MonitorEnumCallback, Terraria); keep-delegates keeps such trampolines alive.
+ * A value already present wins; MADEIRA_MONO_DEFAULTS=0 sets nothing. */
+static struct { const char *name; BOOL changed, had; char value[512]; } madeira_mono_saved[2] =
+    { { "MONO_THREADS_SUSPEND" }, { "MONO_DEBUG" } };
+
+static void madeira_mono_env_save(int i)
+{
+    DWORD len = GetEnvironmentVariableA(madeira_mono_saved[i].name, madeira_mono_saved[i].value,
+                                        sizeof(madeira_mono_saved[i].value));
+    madeira_mono_saved[i].had = len && len < sizeof(madeira_mono_saved[i].value);
+    madeira_mono_saved[i].changed = TRUE;
+}
+
+static void madeira_mono_env_defaults(void)
+{
+    char buf[512];
+    DWORD len;
+
+    if (GetEnvironmentVariableA("MADEIRA_MONO_DEFAULTS", buf, sizeof(buf)) && buf[0] == '0')
+    {
+        ERR("iOS-Madeira ml1282: MADEIRA_MONO_DEFAULTS=0, Mono settings left alone\n");
+        return;
+    }
+    if (!GetEnvironmentVariableA("MONO_THREADS_SUSPEND", buf, sizeof(buf)))
+    {
+        madeira_mono_env_save(0);
+        SetEnvironmentVariableA("MONO_THREADS_SUSPEND", "coop");
+    }
+    len = GetEnvironmentVariableA("MONO_DEBUG", buf, sizeof(buf));
+    if (!len)
+    {
+        madeira_mono_env_save(1);
+        SetEnvironmentVariableA("MONO_DEBUG", "keep-delegates");
+    }
+    else if (len < sizeof(buf) - sizeof(",keep-delegates") && !strstr(buf, "keep-delegates"))
+    {
+        madeira_mono_env_save(1);
+        strcat(buf, ",keep-delegates");
+        SetEnvironmentVariableA("MONO_DEBUG", buf);
+    }
+    {
+        char suspend[64];
+        if (!GetEnvironmentVariableA("MONO_THREADS_SUSPEND", suspend, sizeof(suspend))) suspend[0] = 0;
+        if (!GetEnvironmentVariableA("MONO_DEBUG", buf, sizeof(buf))) buf[0] = 0;
+        ERR("iOS-Madeira ml1282: MONO_THREADS_SUSPEND=%s MONO_DEBUG=%s\n", suspend, buf);
+    }
+}
+
+/* Called once Mono has read both (after mono_jit_init_version). */
+static void madeira_mono_env_restore(void)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(madeira_mono_saved); i++)
+    {
+        if (!madeira_mono_saved[i].changed) continue;
+        SetEnvironmentVariableA(madeira_mono_saved[i].name,
+                                madeira_mono_saved[i].had ? madeira_mono_saved[i].value : NULL);
+        madeira_mono_saved[i].changed = FALSE;
+    }
+}
+
 static HRESULT load_mono(LPCWSTR mono_path)
 {
     static const WCHAR lib[] = {'\\','l','i','b',0};
@@ -192,6 +270,7 @@ static HRESULT load_mono(LPCWSTR mono_path)
 
         if (!find_mono_dll(mono_path, mono_dll_path)) goto fail;
 
+        madeira_mono_env_defaults();
         mono_handle = LoadLibraryW(mono_dll_path);
 
         if (!mono_handle) goto fail;
@@ -379,6 +458,7 @@ MonoDomain* get_root_domain(void)
         exe_basename = get_exe_basename_utf8();
 
         root_domain = mono_jit_init_version(exe_basename, "v4.0.30319");
+        madeira_mono_env_restore();
 
         free(exe_basename);
 

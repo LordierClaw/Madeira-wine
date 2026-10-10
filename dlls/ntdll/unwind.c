@@ -261,6 +261,33 @@ PRUNTIME_FUNCTION WINAPI RtlLookupFunctionTable( ULONG_PTR pc, ULONG_PTR *base, 
 {
     LDR_DATA_TABLE_ENTRY *module;
 
+#ifdef __arm64ec__
+    /* iOS-Madeira ml1203: x64 code of an image whose fixed base is below 4GB
+     * runs at its low addresses, but the image is mapped (and registered with
+     * the loader) high, so no module contained the pc and every exception it
+     * raised was unhandled: a Delphi program based at 0x400000 that catches
+     * its own exception in a try/except died with 0x0eedfade (the Delphi
+     * exception code) instead. Find the
+     * module through the sub-floor window and report the LOW base, so scope
+     * offsets, handlers and unwind targets stay in the domain the code runs
+     * in; the function table itself is read from the real mapping. Reads of
+     * unwind data at base + RVA go through the sub-floor fault service.
+     * MADEIRA_SUBFLOOR_SEH=0 (unix side) turns it off. */
+    if (pc < 0x100000000ull && LdrFindEntryForAddress( (void *)pc, &module ))
+    {
+        ULONG_PTR win[3];
+        static LONG said;
+
+        if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)pc, (MEMORY_INFORMATION_CLASS)1006,
+                                  win, sizeof(win), NULL )) return NULL;
+        if (LdrFindEntryForAddress( (void *)win[1], &module )) return NULL;
+        if (InterlockedIncrement( &said ) <= 8)
+            ERR( "ml1203: x64 unwind data for low pc %#Ix from %s: low base %#Ix, real %p\n",
+                 pc, debugstr_us( &module->BaseDllName ), win[0], module->DllBase );
+        *base = win[0];
+        return RtlImageDirectoryEntryToData( module->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, len );
+    }
+#endif
     if (LdrFindEntryForAddress( (void *)pc, &module )) return NULL;
     *base = (ULONG_PTR)module->DllBase;
 #ifdef __arm64ec__

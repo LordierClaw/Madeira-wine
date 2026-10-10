@@ -14,7 +14,8 @@ x86_64-w64-mingw32-clang -O2 -D__WINESRC__ -Iinclude -Ibuild/include \
 ```
 
 Run `xinput-host-test.exe` on Windows. The test checks state/capability mapping,
-Guide-button filtering, keystroke edges, XInputEnable, invalid arguments,
+Guide-button filtering, keystroke edges, XInputEnable, vibration forwarding
+(including XInputEnable and process detach), invalid arguments,
 unknown battery reporting, and per-user audio/disconnect results. It does not
 exercise the HID fallback or prove device compatibility.
 

@@ -1234,17 +1234,18 @@ enum
 };
 
 /* `op` values for NtUserCallTwoParam_GetGamepadState, packed into arg1 above
- * the user index. Both payloads are pointer-free structs with identical 32-
+ * the user index. All payloads are pointer-free structs with identical 32-
  * and 64-bit layout, which is what lets the wow64 thunk pass them through
  * with nothing but a pointer translation. */
 enum
 {
     NtUserGamepadOp_State,   /* buffer: XINPUT_STATE        (16 bytes, out) */
     NtUserGamepadOp_Caps,    /* buffer: XINPUT_CAPABILITIES (20 bytes, out) */
+    NtUserGamepadOp_SetVibration, /* buffer: XINPUT_VIBRATION (4 bytes, in) */
 };
 
-/* Returns TRUE when a pad is connected in `index` and `buffer` was filled.
- * One syscall into a host snapshot read, no
+/* Returns TRUE when a pad is connected in `index` and `buffer` was filled
+ * (read, for NtUserGamepadOp_SetVibration). One syscall into a host snapshot read, no
  * allocation or server round trip — games poll this at up to 1 kHz. */
 static inline BOOL NtUserGetGamepadState( UINT index, UINT op, void *buffer )
 {

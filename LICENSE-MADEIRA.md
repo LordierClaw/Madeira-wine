@@ -54,6 +54,22 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
     regenerated `unix_thunks.c`, `unix_private.h`, `unix_wgl.c`). Author:
     Connor Gow, written with AI assistance, 2026-09-27. Carried in
     `patches/wine-opengl-winios.patch`.
+  - Author spitefulowl, merged on 2026-10-04: `38aa753f98b` (ntdll ARM64EC:
+    leave the syscall callback on the execute-request early return, pull
+    request #22); `f2f3e4b42e4` (kernelbase iOS: GetTickCount and
+    QueryInterruptTime from the performance counter, pull request #23);
+    `f4bbccf9499` (ntdll ARM64EC: unwind data for x64 code running at a fixed
+    base below 4 GB, pull request #24).
+  - Author meshoklv, merged on 2026-10-05: `30efeaa807b` (ntdll: load the
+    builtin XInput even when the game ships its own copy, pull request #19).
+    Pull request #18 (`b7996f867cb`, ntdll ARM64EC: leave the syscall callback
+    on the execute-request early return) is the same fix as `38aa753f98b`
+    above and came first; it is recorded as merged with no change of its own.
+  - Author bahacan16, merged on 2026-10-06: `67b8c8bed51` (xinput1_3 iOS:
+    send XInputSetState motors to the host pad, pull request #20).
+  - Author spitefulowl, merged on 2026-10-06: `000cac48452` (mscoree iOS:
+    cooperative thread suspend and keep-delegates for Wine Mono, pull request
+    #26).
 
 The LGPL permits combining this library with proprietary components (such
 as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the

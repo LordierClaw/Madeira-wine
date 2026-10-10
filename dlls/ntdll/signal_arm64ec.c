@@ -2224,6 +2224,10 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
             else if (pNotifyMemoryProtect
                      && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
                 pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, st );
+            /* ml1259: this early return skipped the leave, so the thread kept
+             * InSyscallCallback set and its next notifications to FEX (protect,
+             * flush, alloc) were dropped until something else cleared it. */
+            leave_syscall_callback();
             return st;
         }
     }
