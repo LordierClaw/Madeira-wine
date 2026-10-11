@@ -23,7 +23,7 @@ static uint64_t ios_file_profile_now(void)
 
 #define IOS_FILE_COUNTERS(X) \
     X(full_hit) X(full_miss) X(parent_try) X(parent_hit) X(components) \
-    X(component_miss) X(case_query) X(scans) X(entries)
+    X(component_miss) X(case_query) X(scans) X(entries) X(prefix_hint) X(reparse_saved)
 
 enum ios_file_profile_operation { IOS_FILE_CREATE, IOS_FILE_QUERY, IOS_FILE_QUERY_FULL, IOS_FILE_OPERATIONS };
 
@@ -186,7 +186,7 @@ static void ios_file_profile_end(struct ios_file_profile_call *call, const WCHAR
                              "lookup_us=%llu total_us=%llu full_hit=%llu full_miss=%llu "
                              "parent_try=%llu parent_hit=%llu components=%llu component_miss=%llu "
                              "case_query=%llu scans=%llu entries=%llu audio_ok=%llu audio_fail=%llu "
-                             "create=%llu query=%llu query_full=%llu\n",
+                             "create=%llu query=%llu query_full=%llu prefix_hint=%llu reparse_saved=%llu\n",
                              IOS_FILE_PROFILE_TID(), (unsigned long long)((now - s->since) / 1000000),
                              (unsigned long long)s->calls, (unsigned long long)s->ok, (unsigned long long)s->fail,
                              (unsigned long long)(s->lookup_ns / 1000), (unsigned long long)(s->total_ns / 1000),
@@ -198,7 +198,8 @@ static void ios_file_profile_end(struct ios_file_profile_call *call, const WCHAR
                              (unsigned long long)s->audio_fail,
                              (unsigned long long)s->operations[IOS_FILE_CREATE],
                              (unsigned long long)s->operations[IOS_FILE_QUERY],
-                             (unsigned long long)s->operations[IOS_FILE_QUERY_FULL]);
+                             (unsigned long long)s->operations[IOS_FILE_QUERY_FULL],
+                             (unsigned long long)s->prefix_hint, (unsigned long long)s->reparse_saved);
         ios_file_profile_print("worst", &s->worst);
         ios_file_profile_print("failed", &s->failure);
         ios_file_profile_print("audio", &s->audio);

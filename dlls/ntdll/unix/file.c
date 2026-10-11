@@ -2995,8 +2995,13 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
  * The file found is appended to unix_name at pos.
  * There must be at least MAX_DIR_ENTRY_LEN+2 chars available at pos.
  */
+struct file_lookup_reparse
+{
+    BOOL complete, found;
+};
+
 static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
-                                  BOOLEAN check_case )
+                                  BOOLEAN check_case, struct file_lookup_reparse *reparse, BOOL skip_scan )
 {
     WCHAR buffer[MAX_DIR_ENTRY_LEN];
     BOOLEAN is_name_8_dot_3;
@@ -3018,6 +3023,13 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
         IOS_FILE_COUNT(component_miss);
     }
     if (check_case) goto not_found;  /* we want an exact match */
+    /* Keep the native lookup above: APFS can resolve Unicode normalization
+     * variants that the Wine directory-name comparison does not equate. */
+    if (skip_scan)
+    {
+        IOS_FILE_COUNT(reparse_saved);
+        goto not_found;
+    }
 
     if (pos > 1) unix_name[pos - 1] = 0;
     else unix_name[1] = 0;  /* keep the initial slash */
@@ -3094,8 +3106,10 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     }
 
     unix_name[pos - 1] = '/';
-    while ((de = readdir( dir )))
+    for (;;)
     {
+        if (reparse) errno = 0;
+        if (!(de = readdir( dir ))) break;
         IOS_FILE_COUNT(entries);
         ret = ntdll_umbstowcs( de->d_name, strlen(de->d_name), buffer, MAX_DIR_ENTRY_LEN );
         if (ret == length && !wcsnicmp( buffer, name, ret ))
@@ -3104,6 +3118,12 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
             closedir( dir );
             return STATUS_SUCCESS;
         }
+
+        /* iOS callers can reuse this same directory observation for the
+         * immediately following Wine reparse-name search. Normal names
+         * (including short names below) retain priority over reparse names. */
+        if (reparse && ret == length + 1 && buffer[length] == '?' && !wcsnicmp( buffer, name, length ))
+            reparse->found = TRUE;
 
         if (!is_name_8_dot_3) continue;
 
@@ -3119,6 +3139,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
             }
         }
     }
+    if (reparse) reparse->complete = !errno;
     closedir( dir );
 
 not_found:
@@ -3589,6 +3610,19 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     struct stat st;
     char *unix_name = *buffer;
     const WCHAR *ptr, *end;
+#ifdef WINE_IOS
+    /* Hints only: every use re-stats the directory under the current root.
+     * No file/directory existence, case result or negative result is cached.
+     * Fixed storage, no retained handles and no cross-thread synchronization. */
+    static __thread struct
+    {
+        int root_fd, base_pos, length, key_length;
+        unsigned int components;
+        char path[512];
+    } prefix_hints[32];
+    static __thread unsigned int next_hint;
+    int used_prefix_hint = -1;
+#endif
 
     /* check syntax of individual components */
 
@@ -3635,17 +3669,48 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
          * parent first, then binary-search its ancestors for a fresh, exact
          * directory prefix. Resume the normal case/short-name/reparse walk
          * after that prefix; a failed stat is never itself a final result.
-         * No lookup results survive this call. Keep Unix paths unchanged. */
+         * Hints retain no lookup result. Keep Unix paths unchanged. */
         if (!is_unix)
         {
             unsigned int parents = 0, low = 0, high, candidate, i;
-            int prefix_pos = pos;
+            int prefix_pos = pos, hint = -1, length = pos + ret + 1;
+            BOOL used_hint = FALSE;
+
+            for (i = 0; i < ARRAY_SIZE(prefix_hints); i++)
+                if (prefix_hints[i].root_fd == root_fd && prefix_hints[i].base_pos == pos &&
+                    prefix_hints[i].length > prefix_pos && prefix_hints[i].length + 1 < length &&
+                    prefix_hints[i].key_length <= length &&
+                    (!unix_name[prefix_hints[i].key_length] || unix_name[prefix_hints[i].key_length] == '/') &&
+                    !memcmp( unix_name, prefix_hints[i].path, prefix_hints[i].key_length ))
+                {
+                    prefix_pos = prefix_hints[i].length;
+                    hint = i;
+                }
+            if (hint >= 0)
+            {
+                IOS_FILE_COUNT(parent_try);
+                unix_name[prefix_pos] = 0;
+                ret = fstatat( root_fd, unix_name, &st, 0 );
+                unix_name[prefix_pos] = '/';
+                if (!ret && S_ISDIR( st.st_mode ))
+                {
+                    low = prefix_hints[hint].components;
+                    used_hint = TRUE;
+                    used_prefix_hint = hint;
+                    IOS_FILE_COUNT(prefix_hint);
+                }
+                else
+                {
+                    prefix_hints[hint].length = 0;
+                    prefix_pos = pos;
+                }
+            }
 
             /* A trailing slash is part of the final component, not another
              * parent. Count boundaries in the converted path, not its bytes. */
             for (p = unix_name + pos + 1; *p; p++)
                 if (*p == '/' && p[1]) parents++;
-            high = candidate = parents;
+            high = candidate = used_hint ? low : parents;
             while (low < high)
             {
                 p = unix_name + pos;
@@ -3665,6 +3730,24 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             if (low)
             {
                 const WCHAR *next = name;
+                int key_length;
+
+                /* Scope the hint to its next unresolved component. An earlier
+                 * miss in a sibling must not pin deeper paths to a shallow
+                 * ancestor. This key is not a cached negative result. */
+                p = strchr( unix_name + prefix_pos + 1, '/' );
+                key_length = p ? p - unix_name : strlen( unix_name );
+                if (!used_hint && key_length < (int)sizeof(prefix_hints[0].path))
+                {
+                    i = next_hint++ % ARRAY_SIZE(prefix_hints);
+                    prefix_hints[i].root_fd = root_fd;
+                    prefix_hints[i].base_pos = pos;
+                    prefix_hints[i].length = prefix_pos;
+                    prefix_hints[i].key_length = key_length;
+                    prefix_hints[i].components = low;
+                    memcpy( prefix_hints[i].path, unix_name, key_length );
+                    prefix_hints[i].path[key_length] = 0;
+                }
 
                 /* Keep the original UTF-16 offset for reparse resolution. */
                 for (i = 0; i < low; i++)
@@ -3693,6 +3776,12 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     {
         const WCHAR *end, *next;
         WCHAR *reparse_name;
+        struct file_lookup_reparse reparse = {0};
+        struct file_lookup_reparse *scan = NULL;
+        BOOL skip_reparse_scan;
+#ifdef WINE_IOS
+        if (!is_unix) scan = &reparse;
+#endif
 
         end = name;
         while (end < name + name_len && *end != '\\') end++;
@@ -3710,10 +3799,21 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             unix_name = *buffer = new_name;
         }
 
-        status = find_file_in_dir( root_fd, unix_name, pos, name, end - name, is_unix );
+        status = find_file_in_dir( root_fd, unix_name, pos, name, end - name, is_unix, scan, FALSE );
+#ifdef WINE_IOS
+        /* A newly resolvable child makes the old hint shallow. Relearn the
+         * deeper prefix on the next miss instead of repeatedly walking it. */
+        if (used_prefix_hint >= 0 && status == STATUS_SUCCESS) prefix_hints[used_prefix_hint].length = 0;
+        used_prefix_hint = -1;
+#endif
+
+        /* Reuse only the completed in-call directory observation. The native
+         * reparse stat is still required for filesystem normalization rules. */
+        skip_reparse_scan = reparse.complete && !reparse.found;
 
         /* try to resolve it as a reparse point */
-        if (status == STATUS_OBJECT_NAME_NOT_FOUND && (reparse_name = malloc( (end - name + 1) * sizeof(WCHAR) )))
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND &&
+            (reparse_name = malloc( (end - name + 1) * sizeof(WCHAR) )))
         {
             int reparse_fd;
 
@@ -3722,11 +3822,11 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
 
             if (!name_len && open_reparse)
             {
-                status = find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix );
+                status = find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix, NULL, skip_reparse_scan );
             }
             else
             {
-                if (!find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix )
+                if (!find_file_in_dir( root_fd, unix_name, pos, reparse_name, end - name + 1, is_unix, NULL, skip_reparse_scan )
                     && (reparse_fd = openat( root_fd, unix_name, O_RDONLY )) >= 0)
                 {
                     status = resolve_reparse_point( reparse_fd, root_fd, attr, nt_name, nt_pos, next - name, buffer,
