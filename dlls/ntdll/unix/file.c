@@ -2995,6 +2995,10 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
  * The file found is appended to unix_name at pos.
  * There must be at least MAX_DIR_ENTRY_LEN+2 chars available at pos.
  */
+#if defined(WINE_IOS) && defined(__APPLE__)
+#include "ios_directory_index.h"
+#endif
+
 struct file_lookup_reparse
 {
     BOOL complete, found;
@@ -3043,6 +3047,22 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
 
     if (!is_name_8_dot_3)
     {
+#if defined(WINE_IOS) && defined(__APPLE__)
+        char spelling[MAX_DIR_ENTRY_LEN + 1];
+        BOOL has_reparse = FALSE;
+        ret = ios_index_lookup(root_fd, unix_name, name, length, spelling, &has_reparse);
+        if (ret >= 0)
+        {
+            if (ret)
+            {
+                unix_name[pos - 1] = '/';
+                strcpy(unix_name + pos, spelling);
+                return STATUS_SUCCESS;
+            }
+            if (reparse) { reparse->complete = TRUE; reparse->found = has_reparse; }
+            goto not_found;
+        }
+#endif
         IOS_FILE_COUNT(case_query);
         if (!get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
     }
