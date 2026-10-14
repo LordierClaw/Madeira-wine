@@ -4808,6 +4808,107 @@ NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MASK acce
 }
 
 
+#ifdef WINE_IOS
+/* madeira-bcd: [file-trace] (tools/patch-wine-file-trace.py). */
+static void madeira_file_trace( const char *what, unsigned int status, const UNICODE_STRING *nt,
+                                const OBJECT_ATTRIBUTES *attr, unsigned int disp, unsigned int access )
+{
+    static int on = -1, limit;
+    static volatile int n;
+    const WCHAR *w = NULL;
+    unsigned int wl = 0, k = 0;
+    char nb[300];
+    int i;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FILE_TRACE" ), *l = getenv( "MADEIRA_FILE_TRACE_LIMIT" );
+        limit = l ? atoi( l ) : 4000;
+        if (limit <= 0 || limit > 100000) limit = 4000;
+        on = e && e[0] == '1';
+        if (on) dprintf( 2, "[file-trace] madeira-bcd on: every guest open / attribute query, %d lines (MADEIRA_FILE_TRACE)\n", limit );
+    }
+    if (!on || n >= limit) return;
+    if (nt && nt->Buffer) { w = nt->Buffer; wl = nt->Length / sizeof(WCHAR); }
+    else if (attr && attr->ObjectName && attr->ObjectName->Buffer)
+    { w = attr->ObjectName->Buffer; wl = attr->ObjectName->Length / sizeof(WCHAR); }
+    if (w) while (k < wl && k < sizeof(nb) - 1) { nb[k] = (w[k] < 32 || w[k] > 126) ? '?' : (char)w[k]; k++; }
+    nb[k] = 0;
+    /* Madeira's own shader cache (madeira_d3d12's .msc files) is not the game's I/O and
+     * used most of the budget in the first GTA trace (log 2026-10-02 13:21:28). */
+    if (strstr( nb, "\\Madeira\\ShaderCache" )) return;
+    if (status == 0xc0000034 && k > 4)
+    {
+        const char *x = nb + k - 4;
+        if ((x[0] == '.') && (x[1] | 0x20) == 'd' && (x[2] | 0x20) == 'l' && (x[3] | 0x20) == 'l') return;
+    }
+    i = __atomic_add_fetch( &n, 1, __ATOMIC_RELAXED );
+    if (i > limit) return;
+    dprintf( 2, "[file-trace] #%d %s status=0x%08x disp=%u access=0x%08x name=%s\n",
+             i, what, status, disp, access, nb );
+}
+
+/* madeira-bcd: [pipe-trace] (MADEIRA_PIPE_TRACE=1). Social Club's game <-> helper
+ * channel (\\.\pipe\chrome.rgsc_ipc_<pid>_channel_0, Chromium IPC) connects
+ * (OnChannelConnected) but the game never asks the helper for a UI (GTA logs of
+ * 2026-10-02/03). Log every NtWriteFile on a handle whose object name contains
+ * "rgsc_": who writes, how much, and the first bytes, so both directions of the
+ * exchange show up. The name is looked up once per (process, handle). */
+static void madeira_pipe_trace( HANDLE handle, const void *buffer, ULONG length )
+{
+    static int on = -1, limit, bytes = 48;
+    static volatile int n;
+    static struct { void *peb; HANDLE h; int rgsc; } cache[64];
+    static int cache_n;
+    void *peb = NtCurrentTeb()->Peb;
+    int i, k, rgsc = -1, line;
+    char hex[3 * 1024 + 1], asc[1024 + 1];
+    const unsigned char *b = buffer;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_PIPE_TRACE" ), *l = getenv( "MADEIRA_PIPE_TRACE_LIMIT" );
+        const char *nb = getenv( "MADEIRA_PIPE_TRACE_BYTES" );
+        limit = l ? atoi( l ) : 2000;
+        if (limit <= 0 || limit > 100000) limit = 2000;
+        /* bytes shown in hex per write (default 48; 16..1024). The helper's load
+         * events (type 0x10, 58..102 bytes) carry their result past byte 48. */
+        bytes = nb ? atoi( nb ) : 48;
+        if (bytes < 16 || bytes > 1024) bytes = 48;
+        on = e && e[0] == '1';
+        if (on) dprintf( 2, "[pipe-trace] madeira-bcd on: writes to rgsc_ pipes, %d lines, %d bytes (MADEIRA_PIPE_TRACE)\n", limit, bytes );
+    }
+    if (!on || n >= limit) return;
+    for (i = 0; i < cache_n; i++)
+        if (cache[i].peb == peb && cache[i].h == handle) { rgsc = cache[i].rgsc; break; }
+    if (rgsc < 0)
+    {
+        char buf[sizeof(OBJECT_NAME_INFORMATION) + 512];
+        OBJECT_NAME_INFORMATION *oni = (OBJECT_NAME_INFORMATION *)buf;
+        ULONG used = 0;
+        rgsc = 0;
+        if (!NtQueryObject( handle, ObjectNameInformation, oni, sizeof(buf), &used ) && oni->Name.Buffer)
+        {
+            const WCHAR *w = oni->Name.Buffer;
+            unsigned int wl = oni->Name.Length / sizeof(WCHAR), j;
+            for (j = 0; j + 5 <= wl && !rgsc; j++)
+                rgsc = w[j] == 'r' && w[j + 1] == 'g' && w[j + 2] == 's' && w[j + 3] == 'c' && w[j + 4] == '_';
+        }
+        if (cache_n < 64) { cache[cache_n].peb = peb; cache[cache_n].h = handle; cache[cache_n].rgsc = rgsc; cache_n++; }
+    }
+    if (!rgsc || !b) return;
+    for (k = 0; k < bytes && k < (int)length; k++) sprintf( hex + 3 * k, "%02x ", b[k] );
+    hex[3 * k] = 0;
+    for (k = 0; k < (bytes > 96 ? bytes : 96) && k < (int)length; k++) asc[k] = (b[k] < 32 || b[k] > 126) ? '.' : (char)b[k];
+    asc[k] = 0;
+    line = __atomic_add_fetch( &n, 1, __ATOMIC_RELAXED );
+    if (line > limit) return;
+    dprintf( 2, "[pipe-trace] #%d write peb=%p tid=%04x h=%p len=%u | %s| %s\n", line, peb,
+             (unsigned int)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), handle,
+             (unsigned int)length, hex, asc );
+}
+#endif
+
 /******************************************************************************
  *              NtCreateFile   (NTDLL.@)
  */
@@ -5050,6 +5151,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
                      unix_name ? unix_name : "(none)", nb );
         }
     }
+    madeira_file_trace( "open", status, &nt_name, attr, disposition, access );
     if (status && ios_file_fail_logged < 64)
     {
         const WCHAR *w = nt_name.Buffer ? nt_name.Buffer : (attr && attr->ObjectName ? attr->ObjectName->Buffer : NULL);
@@ -5229,6 +5331,7 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
 #ifdef WINE_IOS
     ios_file_profile_end( &profile, attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR),
                           FILE_OPEN, status );
+    madeira_file_trace( "attr", status, nt_name.Buffer ? &nt_name : NULL, attr, 0, 0 );
 #endif
     free( unix_name );
     free( nt_name.Buffer );
@@ -5270,6 +5373,7 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
 #ifdef WINE_IOS
     ios_file_profile_end( &profile, attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR),
                           FILE_OPEN, status );
+    madeira_file_trace( "attr", status, nt_name.Buffer ? &nt_name : NULL, attr, 0, 0 );
 #endif
     free( unix_name );
     free( nt_name.Buffer );
@@ -5348,6 +5452,26 @@ static DWORD ios_wow_volume_serial( WCHAR letter )
     h ^= (unsigned char)letter; h *= 16777619u;
     if (!h || h == ~0u) h = base;
     return h;
+}
+#endif
+
+#ifdef WINE_IOS
+/* madeira-bcd: madeira_fd_stat_only (tools/patch-wine-file-info-fstat.py). The size,
+ * index and end-of-file classes never use the attributes fd_get_file_info reads from
+ * extended attributes, and it fails only when its fstat fails: fstat alone answers them
+ * the same, without two xattr reads per query. MADEIRA_FILE_INFO_FULL=1 restores the call. */
+static int madeira_fd_stat_only( HANDLE handle, int fd, unsigned int options, struct stat *st, ULONG *attr )
+{
+    static int full = -1;
+
+    if (full < 0)
+    {
+        const char *e = getenv( "MADEIRA_FILE_INFO_FULL" );
+        full = e && e[0] == '1';
+    }
+    if (full) return fd_get_file_info( handle, fd, options, st, attr, NULL );
+    *attr = 0;
+    return fstat( fd, st );
 }
 #endif
 
@@ -5478,7 +5602,11 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             FILE_STANDARD_INFORMATION *info = ptr;
 
+#ifdef WINE_IOS
+            if (madeira_fd_stat_only( handle, fd, options, &st, &attr ) == -1)
+#else
             if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+#endif
                 status = errno_to_status( errno );
             else
             {
@@ -5496,7 +5624,11 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileInternalInformation:
+#ifdef WINE_IOS
+        if (madeira_fd_stat_only( handle, fd, options, &st, &attr ) == -1)
+#else
         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+#endif
             status = errno_to_status( errno );
         else
             fill_file_info( &st, attr, ptr, class );
@@ -5508,7 +5640,11 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileEndOfFileInformation:
+#ifdef WINE_IOS
+        if (madeira_fd_stat_only( handle, fd, options, &st, &attr ) == -1)
+#else
         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+#endif
             status = errno_to_status( errno );
         else
             fill_file_info( &st, attr, ptr, class );
@@ -6998,6 +7134,215 @@ error:
 }
 
 
+#ifdef WINE_IOS
+/* madeira-bcd: [guest-log] mirror (tools/patch-wine-guest-log.py). */
+/* guest-log-test:begin (tests/host/check-guest-log.py compiles this region) */
+static int ios_guest_log_fd_path( int fd, char *path, size_t size )
+{
+#ifdef F_GETPATH
+    (void)size;   /* F_GETPATH writes at most MAXPATHLEN (PATH_MAX) bytes */
+    return fcntl( fd, F_GETPATH, path ) != -1;
+#else
+    char link[64];
+    ssize_t n;
+    snprintf( link, sizeof(link), "/proc/self/fd/%d", fd );
+    if ((n = readlink( link, path, size - 1 )) < 0) return 0;
+    path[n] = 0;
+    return 1;
+#endif
+}
+
+static int ios_guest_log_keep( const char *line, size_t len )
+{
+    static const char *const words[] =
+    {
+        "error", "fail", "exception", "unsupported", "not supported", "gpu", "driver",
+        "adapter", "graphics", "monitor", "display", "nvapi", "nvidia",
+    };
+    char lower[320];
+    size_t i;
+
+    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
+    for (i = 0; i < len; i++)
+        lower[i] = line[i] >= 'A' && line[i] <= 'Z' ? line[i] + ('a' - 'A') : line[i];
+    lower[len] = 0;
+    for (i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+        if (strstr( lower, words[i] )) return 1;
+    return 0;
+}
+
+/* A BOM can be its own NtWriteFile call. Without one, require several ASCII
+ * code units with the correct zero-byte layout before considering UTF-16.
+ * Validate the whole bounded input, including text beyond the output limit;
+ * do not reinterpret arbitrary NUL-containing writes as text. No fd state is
+ * cached, so descriptor reuse and different writers cannot mix encodings. */
+static int ios_guest_log_utf16( const unsigned char *src, unsigned int n,
+                              int clipped, char *dst, unsigned int capacity )
+{
+    unsigned int i, start = 0, ascii_le = 0, ascii_be = 0, written = 0;
+    int endian = 0, full = 0;
+
+    if (n < 2 || (n & 1)) return -1;
+    if (src[0] == 0xff && src[1] == 0xfe) { endian = 1; start = 2; }
+    else if (src[0] == 0xfe && src[1] == 0xff) { endian = 2; start = 2; }
+    else
+    {
+        for (i = 0; i < n; i += 2)
+        {
+            unsigned int a = src[i], b = src[i + 1];
+            if (!b && ((a >= 32 && a <= 126) || a == '\n' || a == '\r' || a == '\t')) ascii_le++;
+            if (!a && ((b >= 32 && b <= 126) || b == '\n' || b == '\r' || b == '\t')) ascii_be++;
+        }
+        if (ascii_le >= 4 && ascii_le >= (n / 2) - (n / 2) / 4) endian = 1;
+        else if (ascii_be >= 4 && ascii_be >= (n / 2) - (n / 2) / 4) endian = 2;
+        else return -1;
+    }
+    for (i = start; i < n; i += 2)
+    {
+        unsigned int c = endian == 1 ? src[i] | (src[i + 1] << 8) : (src[i] << 8) | src[i + 1];
+        unsigned int bytes;
+        if ((c < 32 && c != '\n' && c != '\r' && c != '\t') || (c >= 127 && c <= 159)) return -1;
+        if (c >= 0xd800 && c <= 0xdbff)
+        {
+            unsigned int low;
+            if (i + 3 >= n)
+            {
+                if (clipped) break; /* bounded prefix ended between a surrogate pair */
+                return -1;
+            }
+            low = endian == 1 ? src[i + 2] | (src[i + 3] << 8) : (src[i + 2] << 8) | src[i + 3];
+            if (low < 0xdc00 || low > 0xdfff) return -1;
+            c = 0x10000 + ((c - 0xd800) << 10) + low - 0xdc00;
+            i += 2;
+        }
+        else if (c >= 0xdc00 && c <= 0xdfff) return -1;
+        if (c == 0xfffe || c == 0xffff) return -1;
+        bytes = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+        if (full || bytes > capacity - written) { full = 1; continue; }
+        if (bytes == 1) dst[written++] = c;
+        else
+        {
+            if (bytes == 2) dst[written++] = 0xc0 | (c >> 6);
+            else if (bytes == 3)
+            {
+                dst[written++] = 0xe0 | (c >> 12);
+                dst[written++] = 0x80 | ((c >> 6) & 0x3f);
+            }
+            else
+            {
+                dst[written++] = 0xf0 | (c >> 18);
+                dst[written++] = 0x80 | ((c >> 12) & 0x3f);
+                dst[written++] = 0x80 | ((c >> 6) & 0x3f);
+            }
+            dst[written++] = 0x80 | (c & 0x3f);
+        }
+    }
+    return written;
+}
+
+static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int length )
+{
+    static int mode = -1;                 /* 0 off, 1 keyword lines, 2 every line */
+    static unsigned int limit, emitted, announced;
+    static unsigned long long previous_hash, file_hashes[8];
+    const unsigned char *text = buffer;
+    unsigned int i, n, start, serial;
+    int saved_errno = errno, have_path = 0, m = __atomic_load_n( &mode, __ATOMIC_RELAXED );
+    char path[PATH_MAX];
+    char decoded[4096];
+
+    if (m < 0)
+    {
+        const char *e = getenv( "MADEIRA_GUEST_LOG" ), *old = getenv( "MADEIRA_GUEST_LOG_ERRORS" );
+        const char *l = getenv( "MADEIRA_GUEST_LOG_LIMIT" );
+        unsigned int lim;
+
+        if ((e && !strcmp( e, "0" )) || (old && !strcmp( old, "0" ))) m = 0;
+        else if (e && !strcasecmp( e, "all" )) m = 2;
+        else m = 1;
+        lim = l ? (unsigned int)strtoul( l, NULL, 10 ) : 0;
+        if (!lim || lim > 4000) lim = m == 2 ? 400 : 64;
+        __atomic_store_n( &limit, lim, __ATOMIC_RELAXED );
+        __atomic_store_n( &mode, m, __ATOMIC_RELAXED );
+        if (!__atomic_exchange_n( &announced, 1, __ATOMIC_RELAXED ))
+            dprintf( 2, "[guest-log] madeira-bcd text-log mirror: %s, %u lines (MADEIRA_GUEST_LOG=all|0, "
+                     "MADEIRA_GUEST_LOG_LIMIT=N)\n", m == 0 ? "off" : m == 2 ? "every line" : "error/GPU/display lines",
+                     lim );
+    }
+    if (!m || length < 5) goto out;
+    if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) goto out;
+
+    n = length < 4096 ? length : 4096;
+    {
+        int wide = n >= 2 && ((text[0] == 0xff && text[1] == 0xfe) ||
+                              (text[0] == 0xfe && text[1] == 0xff));
+        for (i = 0; !wide && i < n; i++) if (!text[i]) wide = 1;
+        if (wide)
+        {
+            int count = ios_guest_log_utf16( text, n, length > n, decoded, sizeof(decoded) );
+            if (count < 0) goto out;
+            n = count;
+            text = (const unsigned char *)decoded;
+        }
+    }
+    for (i = 0; i < n; i++)
+        if (text[i] < 32 && text[i] != '\n' && text[i] != '\r' && text[i] != '\t') goto out;   /* binary */
+
+    for (start = 0; start < n; start = i + 1)
+    {
+        unsigned long long hash = 14695981039346656037ULL;
+        unsigned int len, shown, j;
+
+        for (i = start; i < n && text[i] != '\n'; i++) ;
+        len = i - start;
+        while (len && (text[start + len - 1] == '\r' || text[start + len - 1] == ' ')) len--;
+        if (len < 3) continue;
+        if (m == 1 && !ios_guest_log_keep( (const char *)text + start, len )) continue;
+        if (!have_path)
+        {
+            const char *name, *ext;
+            if (!ios_guest_log_fd_path( fd, path, sizeof(path) )) goto out;
+            name = strrchr( path, '/' );
+            name = name ? name + 1 : path;
+            ext = strrchr( name, '.' );
+            /* only *.log and output_log.txt; never arbitrary text files */
+            if ((!ext || strcasecmp( ext, ".log" )) && strcasecmp( name, "output_log.txt" )) goto out;
+            have_path = 1;
+            {
+                unsigned long long ph = 14695981039346656037ULL;
+                const char *p;
+                for (p = path; *p; p++) ph = (ph ^ (unsigned char)*p) * 1099511628211ULL;
+                for (j = 0; j < 8; j++)
+                {
+                    unsigned long long cur = __atomic_load_n( &file_hashes[j], __ATOMIC_RELAXED );
+                    if (cur == ph) break;
+                    if (!cur && __atomic_compare_exchange_n( &file_hashes[j], &cur, ph, 0,
+                                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+                    {
+                        dprintf( 2, "[guest-log] file %s\n", path );
+                        break;
+                    }
+                    if (cur == ph) break;
+                }
+            }
+        }
+        for (j = 0; j < len; j++) hash = (hash ^ text[start + j]) * 1099511628211ULL;
+        if (__atomic_exchange_n( &previous_hash, hash, __ATOMIC_RELAXED ) == hash) continue;
+        serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
+        if (serial >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) break;
+        shown = len > 300 ? 300 : len;
+        /* Keep a truncated UTF-8 line valid, including decoded UTF-16. */
+        if (shown < len)
+            while (shown && (text[start + shown] & 0xc0) == 0x80) shown--;
+        dprintf( 2, "[guest-log] #%u tid=%04x %.*s%s\n", serial + 1, (unsigned int)GetCurrentThreadId(),
+                 (int)shown, (const char *)text + start, shown < len ? " [truncated]" : "" );
+    }
+out:
+    errno = saved_errno;
+}
+/* guest-log-test:end */
+#endif
+
 /******************************************************************************
  *              NtWriteFile   (NTDLL.@)
  */
@@ -7018,6 +7363,9 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
 
     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
            handle, event, apc, apc_user, io, buffer, length, offset, key );
+#ifdef WINE_IOS
+    madeira_pipe_trace( handle, buffer, length );
+#endif
 
     if (!io) return STATUS_ACCESS_VIOLATION;
 
@@ -7199,6 +7547,11 @@ done:
     send_completion = cvalue != 0;
 
 err:
+#ifdef WINE_IOS
+    /* madeira-bcd: [guest-log] mirror: tools/patch-wine-guest-log.py */
+    if (status == STATUS_SUCCESS && type == FD_TYPE_FILE && total)
+        ios_guest_log_mirror( unix_handle, buffer, total );
+#endif
     if (needs_close) close( unix_handle );
 
     if (type == FD_TYPE_SERIAL && (status == STATUS_SUCCESS || status == STATUS_PENDING))

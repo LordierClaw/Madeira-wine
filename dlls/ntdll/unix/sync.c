@@ -57,6 +57,8 @@
 #include <time.h>
 #ifdef __APPLE__
 # include <mach/mach_time.h>
+# include <mach/mach.h>
+# include <mach/mach_vm.h>
 #endif
 #ifdef HAVE_KQUEUE
 # include <sys/event.h>
@@ -4962,6 +4964,23 @@ int ios_alert_waiter_lookup( unsigned int tid, const void **addr, int *age_s, in
     return 0;
 }
 
+/* madeira-bcd: fault-safe waiter diagnostics. The native monitor may see
+ * stale or PROT_NONE guest addresses. A successful msync is not a readable
+ * mapping guarantee. Mach performs the copy without a fault on this thread;
+ * the temporary buffer also keeps failed/short reads out of the output. */
+static int ios_alert_waiter_read( void *out, const void *addr, size_t size )
+{
+    unsigned char data[64];
+    mach_vm_size_t got = 0;
+
+    if (!size || size > sizeof(data)) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ULONG_PTR)addr,
+                               size, (mach_vm_address_t)(ULONG_PTR)data, &got ) != KERN_SUCCESS ||
+        got != size) return 0;
+    memcpy( out, data, size );
+    return 1;
+}
+
 void ios_alert_waiter_dump(void)
 {
     LARGE_INTEGER now;
@@ -5003,11 +5022,7 @@ void ios_alert_waiter_dump(void)
                 {
                     ULONG_PTR row = base + line * 0x40;
                     unsigned long long w[8] = { 0 };
-                    char *page = (char *)(row & ~0x3fffULL);
-                    if (msync( page, 0x4000, MS_ASYNC )) continue;
-                    if ((((row + 0x38) & ~0x3fffULL) != (ULONG_PTR)page) &&
-                        msync( (char *)((row + 0x38) & ~0x3fffULL), 0x4000, MS_ASYNC )) continue;
-                    memcpy( w, (void *)row, 0x40 );
+                    if (!ios_alert_waiter_read( w, (void *)row, sizeof(w) )) continue;
                     dprintf( 2, "[hot-lock]  %p: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
                              (void *)row, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7] );
                 }
@@ -5024,20 +5039,14 @@ void ios_alert_waiter_dump(void)
         age = (now.QuadPart - (LONGLONG)ios_alert_waiters[i].since) / 10000000;
         if (age < 60) continue;
         shown++;
-        /* safe-probe the lock word: msync rejects unmapped pages (Darwin
-         * returns ENOMEM).  ml442: read the CONTAINING aligned word — SRW and
-         * FEX WritePriorityMutex read-waits pass lock+2 (2-aligned), which the
-         * old 4-aligned-only guard refused (ml441's deaddead trio). */
+        /* Read the containing aligned word (SRW/read waits can pass lock+2).
+         * A dead process may already have released or protected this page. */
         if (!((ULONG_PTR)a & 1) && (ULONG_PTR)a > 0x10000 && (ULONG_PTR)a < 0x8000000000ULL)
         {
             ULONG_PTR al = (ULONG_PTR)a & ~3ULL;
-            char *page = (char *)(al & ~0x3fffULL);
-            if (!msync( page, 0x4000, MS_ASYNC ))
-            {
-                w0 = *(volatile unsigned int *)al;
-                if (((al + 4) & ~0x3fffULL) == (ULONG_PTR)page)
-                    w1 = *(volatile unsigned int *)(al + 4);
-            }
+            ios_alert_waiter_read( &w0, (void *)al, sizeof(w0) );
+            if (((al + 4) & ~0x3fffULL) == (al & ~0x3fffULL))
+                ios_alert_waiter_read( &w1, (void *)(al + 4), sizeof(w1) );
         }
         dprintf( 2, "[waiters]  tid=%04x addr=%p age=%ds %s w0=%08x w1=%08x\n",
                  (int)(ULONG_PTR)tid, a, (int)age,
@@ -5057,6 +5066,36 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
 {
     static struct { unsigned long long lock; int strikes; } susp[8];
     int i, j, k;
+    /* madeira-bcd lock-orphan (tools/patch-wine-lock-orphan.py): env
+     * MADEIRA_LOCK_ORPHAN = stamped counts strikes once per lock per cycle and
+     * releases only locks a live thread has stamped (FEX's code-buffer locks);
+     * = 0 releases nothing; unset keeps the reaper as it was. */
+    static int orphan_mode = -1;            /* 0 as before, 1 stamped, 2 off */
+    static unsigned long long ever[64];     /* locks a live thread has stamped */
+    static int never, ever_next;
+    unsigned long long done[32];            /* locks already looked at in this cycle */
+    int ndone = 0;
+
+    if (orphan_mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_LOCK_ORPHAN" );
+        orphan_mode = !e ? 0 : !strcmp( e, "stamped" ) ? 1 : !strcmp( e, "0" ) ? 2 : 0;
+        if (orphan_mode)
+            dprintf( 2, "[lock-orphan] madeira-bcd MADEIRA_LOCK_ORPHAN=%s: %s\n", e,
+                     orphan_mode == 1 ? "only locks a live thread has stamped are released, after 3 monitor cycles"
+                                      : "no orphan-lock releases" );
+    }
+    if (orphan_mode == 2) return;
+    if (orphan_mode == 1)
+        for (k = 0; k < nstamps; k++)
+        {
+            if (!live_stamps[k]) continue;
+            for (j = 0; j < never; j++) if (ever[j] == live_stamps[k]) break;
+            if (j < never) continue;
+            ever[ever_next] = live_stamps[k];
+            ever_next = (ever_next + 1) % 64;
+            if (never < 64) never++;
+        }
     for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
     {
         const void *a = ios_alert_waiters[i].addr;
@@ -5065,6 +5104,16 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
         int nsame = 0, stamped = 0;
         if (!a || ((ULONG_PTR)a & 3) != 2 || (ULONG_PTR)a < 0x10000 || (ULONG_PTR)a >= 0x8000000000ULL) continue;
         lock = (unsigned long long)(ULONG_PTR)a - 2;
+        if (orphan_mode == 1)
+        {
+            /* madeira-bcd lock-orphan: each lock once per cycle (one strike, not
+             * one per parked waiter), and never a lock nobody has stamped */
+            for (k = 0; k < ndone; k++) if (done[k] == lock) break;
+            if (k < ndone || ndone == 32) continue;
+            done[ndone++] = lock;
+            for (k = 0; k < never; k++) if (ever[k] == lock) break;
+            if (k == never) continue;
+        }
         for (j = 0; j < IOS_ALERT_WAITER_MAX; j++)
             if (ios_alert_waiters[j].addr == a) nsame++;
         if (nsame < 3) continue;
