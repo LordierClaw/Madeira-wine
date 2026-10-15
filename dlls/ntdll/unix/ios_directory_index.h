@@ -34,6 +34,32 @@ static pthread_mutex_t ios_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int ios_index_queue = -1, ios_index_enabled = -1;
 static uint64_t ios_index_age;
 
+/* One directory stat the current lookup_unix_name call already made, for the
+ * same root and path. It is used at most once and forgotten when the next
+ * lookup starts, so it never carries a result across requests. */
+static __thread struct
+{
+    int root, valid;
+    struct stat st;
+    char path[512];
+} ios_index_known;
+
+static void ios_index_note(int root, const char *path, const struct stat *st)
+{
+    size_t length = strlen(path);
+    ios_index_known.valid = 0;
+    if (length >= sizeof(ios_index_known.path)) return;
+    memcpy(ios_index_known.path, path, length + 1);
+    ios_index_known.root = root;
+    ios_index_known.st = *st;
+    ios_index_known.valid = 1;
+}
+
+static void ios_index_forget(void)
+{
+    ios_index_known.valid = 0;
+}
+
 static BOOL ios_index_same(const struct stat *a, const struct stat *b)
 {
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
@@ -82,16 +108,22 @@ static unsigned int ios_index_hash(const WCHAR *name, int length)
 
 static const char *ios_index_find(struct ios_index_dir *d, const WCHAR *name, int length)
 {
-    unsigned int hash = ios_index_hash(name, length), at, best = 0;
+    unsigned int hash = ios_index_hash(name, length), at, best = 0, exact = 0;
     for (at = ((unsigned int *)d->data)[hash % IOS_INDEX_BUCKETS]; at;)
     {
         struct ios_index_record *r = (void *)(d->data + at);
         const WCHAR *wide = (const WCHAR *)(r + 1);
-        /* Preserve the first readdir spelling when case-folded names collide. */
-        if (r->hash == hash && r->length == (unsigned int)length && !wcsnicmp(wide, name, length) && (!best || at < best))
-            best = at;
+        /* An exact spelling wins, as the literal native stat would find it;
+         * otherwise preserve the first readdir spelling when case-folded
+         * names collide. */
+        if (r->hash == hash && r->length == (unsigned int)length && !wcsnicmp(wide, name, length))
+        {
+            if (!memcmp(wide, name, length * sizeof(WCHAR))) exact = at;
+            if (!best || at < best) best = at;
+        }
         at = r->next;
     }
+    if (exact) best = exact;
     if (best)
     {
         struct ios_index_record *r = (void *)(d->data + best);
@@ -100,10 +132,12 @@ static const char *ios_index_find(struct ios_index_dir *d, const WCHAR *name, in
     return NULL;
 }
 
-/* -1 = uncertain/fallback, 0 = absent, 1 = matched spelling. The caller must
- * retain its native exact stat (including the literal reparse-name probe).
- * A fresh path stat prevents ancestor replacement, rename and root-fd reuse
- * from turning a watch on the old inode into authority for the new path. */
+/* -1 = uncertain/fallback, 0 = absent, 1 = matched spelling. A non-ASCII
+ * caller must retain its native exact stat (including the literal
+ * reparse-name probe): APFS equates normalization variants the names here do
+ * not. A fresh path stat (made here, or by the same lookup just before)
+ * prevents ancestor replacement, rename and root-fd reuse from turning a
+ * watch on the old inode into authority for the new path. */
 static int ios_index_lookup(int root, const char *path, const WCHAR *name, int length,
                             char *out, BOOL *has_reparse)
 {
@@ -129,7 +163,14 @@ static int ios_index_lookup(int root, const char *path, const WCHAR *name, int l
         if ((ios_index_queue = kqueue()) < 0) goto done;
         fcntl(ios_index_queue, F_SETFD, FD_CLOEXEC);
     }
-    if (fstatat(root, path, &before, 0) || !S_ISDIR(before.st_mode) || !ios_index_poll()) goto done;
+    if (ios_index_known.valid && ios_index_known.root == root && !strcmp(ios_index_known.path, path))
+    {
+        before = ios_index_known.st;
+        IOS_FILE_COUNT(dir_reused);
+    }
+    else if (fstatat(root, path, &before, 0)) goto done;
+    ios_index_known.valid = 0;
+    if (!S_ISDIR(before.st_mode) || !ios_index_poll()) goto done;
     for (i = 0; i < IOS_INDEX_SLOTS; i++)
     {
         struct ios_index_dir *slot = &ios_index_dirs[i];

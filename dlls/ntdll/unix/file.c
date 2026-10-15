@@ -3004,6 +3004,42 @@ struct file_lookup_reparse
     BOOL complete, found;
 };
 
+#if defined(WINE_IOS) && defined(__APPLE__)
+#define IOS_INDEX_NOTE(root, path, st) ios_index_note( root, path, st )
+#define IOS_INDEX_FORGET() ios_index_forget()
+
+/* An ASCII name has no other spelling under APFS canonical normalization, so
+ * a fresh index that lacks it case-insensitively proves the literal native
+ * stat would fail too. A '~' name may be a Wine short name; leave those, and
+ * every non-ASCII name, to the literal stat first. */
+static BOOL ios_index_ascii_name( const WCHAR *name, int length )
+{
+    int i;
+    for (i = 0; i < length; i++) if (name[i] >= 0x80 || name[i] == '~') return FALSE;
+    return length > 0;
+}
+
+/* 1: found, spelling appended at pos; 0: absent; -1: no fresh index. */
+static int ios_find_with_index( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
+                                struct file_lookup_reparse *reparse )
+{
+    char spelling[MAX_DIR_ENTRY_LEN + 1], saved;
+    BOOL has_reparse = FALSE;
+    int at = pos > 1 ? pos - 1 : 1, ret;
+
+    saved = unix_name[at];
+    unix_name[at] = 0;  /* the directory, as the scan below opens it */
+    ret = ios_index_lookup( root_fd, unix_name, name, length, spelling, &has_reparse );
+    unix_name[at] = saved;
+    if (ret > 0) strcpy( unix_name + pos, spelling );
+    else if (!ret && reparse) { reparse->complete = TRUE; reparse->found = has_reparse; }
+    return ret;
+}
+#else
+#define IOS_INDEX_NOTE(root, path, st) ((void)0)
+#define IOS_INDEX_FORGET() ((void)0)
+#endif
+
 static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
                                   BOOLEAN check_case, struct file_lookup_reparse *reparse, BOOL skip_scan )
 {
@@ -3013,6 +3049,9 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     struct dirent *de;
     struct stat st;
     int fd, ret;
+#if defined(WINE_IOS) && defined(__APPLE__)
+    BOOL index_tried = FALSE;
+#endif
 
     IOS_FILE_COUNT(components);
 
@@ -3023,6 +3062,29 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     if (ret >= 0 && ret <= MAX_DIR_ENTRY_LEN)
     {
         unix_name[pos + ret] = 0;
+#if defined(WINE_IOS) && defined(__APPLE__)
+        /* Asset/DLC probes are ASCII and mostly absent. A fresh index answers
+         * them without the literal stat (and the reparse-name probe after a
+         * complete observation without one, without a second stat). */
+        if (!check_case && ios_index_ascii_name( name, length ))
+        {
+            if (skip_scan)
+            {
+                IOS_FILE_COUNT(component_miss);
+                IOS_FILE_COUNT(reparse_saved);
+                goto not_found;
+            }
+            ret = ios_find_with_index( root_fd, unix_name, pos, name, length, reparse );
+            if (ret > 0) return STATUS_SUCCESS;
+            if (!ret)
+            {
+                IOS_FILE_COUNT(component_miss);
+                IOS_FILE_COUNT(index_absent);
+                goto not_found;
+            }
+            index_tried = TRUE;
+        }
+#endif
         if (!fstatat( root_fd, unix_name, &st, 0 )) return STATUS_SUCCESS;
         IOS_FILE_COUNT(component_miss);
     }
@@ -3050,7 +3112,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
 #if defined(WINE_IOS) && defined(__APPLE__)
         char spelling[MAX_DIR_ENTRY_LEN + 1];
         BOOL has_reparse = FALSE;
-        ret = ios_index_lookup(root_fd, unix_name, name, length, spelling, &has_reparse);
+        ret = index_tried ? -1 : ios_index_lookup(root_fd, unix_name, name, length, spelling, &has_reparse);
         if (ret >= 0)
         {
             if (ret)
@@ -3644,6 +3706,8 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     int used_prefix_hint = -1;
 #endif
 
+    IOS_INDEX_FORGET();
+
     /* check syntax of individual components */
 
     for (ptr = name, end = name + name_len; ptr < end; ptr++)
@@ -3675,27 +3739,24 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     if (ret >= 0 && ret < unix_len - pos - 1)
     {
         char *p;
+#ifdef WINE_IOS
+        unsigned int parents = 0, low = 0, high, candidate, i;
+        int prefix_pos = pos, hint = -1, length = pos + ret + 1;
+        BOOL used_hint = FALSE;
+#endif
         unix_name[pos + 1 + ret] = 0;
         for (p = unix_name + pos ; *p; p++) if (*p == '\\') *p = '/';
-        if (!fstatat( root_fd, unix_name, &st, 0 ))
-        {
-            IOS_FILE_COUNT(full_hit);
-            if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
-            return STATUS_SUCCESS;
-        }
-        IOS_FILE_COUNT(full_miss);
 #ifdef WINE_IOS
-        /* Asset/DLC probes also miss intermediate directories. Try the full
-         * parent first, then binary-search its ancestors for a fresh, exact
-         * directory prefix. Resume the normal case/short-name/reparse walk
-         * after that prefix; a failed stat is never itself a final result.
-         * Hints retain no lookup result. Keep Unix paths unchanged. */
+        /* Asset/DLC probes also miss intermediate directories. A hint names a
+         * fresh, exact directory prefix whose next component was missing the
+         * last time; such a request starts its walk there, after a fresh stat
+         * of that prefix, without first statting the whole path (the walk
+         * finds the path when it exists now). Otherwise try the whole path,
+         * then binary-search its ancestors. A failed stat is never itself a
+         * final result, and hints retain no lookup result. Keep Unix paths
+         * unchanged. */
         if (!is_unix)
         {
-            unsigned int parents = 0, low = 0, high, candidate, i;
-            int prefix_pos = pos, hint = -1, length = pos + ret + 1;
-            BOOL used_hint = FALSE;
-
             for (i = 0; i < ARRAY_SIZE(prefix_hints); i++)
                 if (prefix_hints[i].root_fd == root_fd && prefix_hints[i].base_pos == pos &&
                     prefix_hints[i].length > prefix_pos && prefix_hints[i].length + 1 < length &&
@@ -3711,6 +3772,8 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
                 IOS_FILE_COUNT(parent_try);
                 unix_name[prefix_pos] = 0;
                 ret = fstatat( root_fd, unix_name, &st, 0 );
+                /* The walk's first directory index lookup reuses this stat. */
+                if (!ret && S_ISDIR( st.st_mode )) IOS_INDEX_NOTE( root_fd, unix_name, &st );
                 unix_name[prefix_pos] = '/';
                 if (!ret && S_ISDIR( st.st_mode ))
                 {
@@ -3718,6 +3781,7 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
                     used_hint = TRUE;
                     used_prefix_hint = hint;
                     IOS_FILE_COUNT(prefix_hint);
+                    IOS_FILE_COUNT(full_skip);
                 }
                 else
                 {
@@ -3725,7 +3789,21 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
                     prefix_pos = pos;
                 }
             }
-
+        }
+        if (!used_hint)
+#endif
+        {
+            if (!fstatat( root_fd, unix_name, &st, 0 ))
+            {
+                IOS_FILE_COUNT(full_hit);
+                if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
+                return STATUS_SUCCESS;
+            }
+            IOS_FILE_COUNT(full_miss);
+        }
+#ifdef WINE_IOS
+        if (!is_unix)
+        {
             /* A trailing slash is part of the final component, not another
              * parent. Count boundaries in the converted path, not its bytes. */
             for (p = unix_name + pos + 1; *p; p++)

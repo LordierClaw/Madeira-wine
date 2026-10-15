@@ -24,7 +24,8 @@ static uint64_t ios_file_profile_now(void)
 #define IOS_FILE_COUNTERS(X) \
     X(full_hit) X(full_miss) X(parent_try) X(parent_hit) X(components) \
     X(component_miss) X(case_query) X(scans) X(entries) X(prefix_hint) X(reparse_saved) \
-    X(index_hit) X(index_build) X(index_stale) X(index_fallback)
+    X(index_hit) X(index_build) X(index_stale) X(index_fallback) \
+    X(full_skip) X(index_absent) X(dir_reused)
 
 enum ios_file_profile_operation { IOS_FILE_CREATE, IOS_FILE_QUERY, IOS_FILE_QUERY_FULL, IOS_FILE_OPERATIONS };
 
@@ -188,7 +189,8 @@ static void ios_file_profile_end(struct ios_file_profile_call *call, const WCHAR
                              "parent_try=%llu parent_hit=%llu components=%llu component_miss=%llu "
                              "case_query=%llu scans=%llu entries=%llu audio_ok=%llu audio_fail=%llu "
                              "create=%llu query=%llu query_full=%llu prefix_hint=%llu reparse_saved=%llu "
-                             "index_hit=%llu index_build=%llu index_stale=%llu index_fallback=%llu\n",
+                             "index_hit=%llu index_build=%llu index_stale=%llu index_fallback=%llu "
+                             "full_skip=%llu index_absent=%llu dir_reused=%llu\n",
                              IOS_FILE_PROFILE_TID(), (unsigned long long)((now - s->since) / 1000000),
                              (unsigned long long)s->calls, (unsigned long long)s->ok, (unsigned long long)s->fail,
                              (unsigned long long)(s->lookup_ns / 1000), (unsigned long long)(s->total_ns / 1000),
@@ -203,7 +205,9 @@ static void ios_file_profile_end(struct ios_file_profile_call *call, const WCHAR
                              (unsigned long long)s->operations[IOS_FILE_QUERY_FULL],
                              (unsigned long long)s->prefix_hint, (unsigned long long)s->reparse_saved,
                              (unsigned long long)s->index_hit, (unsigned long long)s->index_build,
-                             (unsigned long long)s->index_stale, (unsigned long long)s->index_fallback);
+                             (unsigned long long)s->index_stale, (unsigned long long)s->index_fallback,
+                             (unsigned long long)s->full_skip, (unsigned long long)s->index_absent,
+                             (unsigned long long)s->dir_reused);
         ios_file_profile_print("worst", &s->worst);
         ios_file_profile_print("failed", &s->failure);
         ios_file_profile_print("audio", &s->audio);
