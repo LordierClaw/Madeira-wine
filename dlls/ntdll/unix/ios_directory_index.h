@@ -44,7 +44,7 @@ static __thread struct
     char path[512];
 } ios_index_known;
 
-static void ios_index_note(int root, const char *path, const struct stat *st)
+static inline void ios_index_note(int root, const char *path, const struct stat *st)
 {
     size_t length = strlen(path);
     ios_index_known.valid = 0;
@@ -55,7 +55,7 @@ static void ios_index_note(int root, const char *path, const struct stat *st)
     ios_index_known.valid = 1;
 }
 
-static void ios_index_forget(void)
+static inline void ios_index_forget(void)
 {
     ios_index_known.valid = 0;
 }
